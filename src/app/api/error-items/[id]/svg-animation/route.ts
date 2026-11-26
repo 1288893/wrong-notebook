@@ -1,0 +1,123 @@
+import { NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { getAIService } from "@/lib/ai";
+import { notFound, badRequest, internalError, taskAlreadyRunning } from "@/lib/api-errors";
+import { withUser } from "@/lib/api-handler";
+import type { AuthenticatedContext } from "@/lib/api-handler";
+import { createLogger } from "@/lib/logger";
+import { describeQuestion, findRunningTask, reserveBackgroundTask, runReservedTask } from "@/lib/background-tasks";
+import { serializeWrite } from "@/lib/db-write-queue";
+import { consumeAiQuota } from "@/lib/ai-quota";
+import { withRecoverableResponse } from "@/lib/recoverable-response";
+import { svgAnimationSchema } from "@/lib/schemas/error-items";
+
+const logger = createLogger('api:error-items:svg-animation');
+
+type RouteContext = { params: Promise<{ id: string }> };
+type AnimationLanguage = 'zh' | 'en';
+
+/** 动画按语言分别保存：中文版存 svgAnimation，英文版存 svgAnimationEn；未指定时为中文 */
+function parseLanguage(value: unknown): AnimationLanguage {
+    return value === 'en' ? 'en' : 'zh';
+}
+
+function animationField(language: AnimationLanguage) {
+    return language === 'en' ? 'svgAnimationEn' : 'svgAnimation';
+}
+
+/** 当前用户拥有的错题；不存在或不属于该用户时返回 null */
+async function findOwnedItem(id: string, userId: string) {
+    const item = await prisma.errorItem.findUnique({
+        where: { id },
+        select: { userId: true, shortId: true, questionText: true, answerText: true, analysis: true, figureSvg: true },
+    });
+    return item && item.userId === userId ? item : null;
+}
+
+/**
+ * POST /api/error-items/:id/svg-animation
+ * 由 AI 根据题目、答案和解析生成 SVG 动画讲解并保存（覆盖该语言已有的动画）
+ * 请求体 { language: 'zh' | 'en' }：动画中的文字使用该语言，未指定时为中文
+ */
+async function handlePost(req: Request, { user, params }: RouteContext & AuthenticatedContext) {
+    const { id } = await params;
+    const parsed = svgAnimationSchema.safeParse(await req.json().catch(() => ({})));
+    const language = parseLanguage(parsed.success ? parsed.data.language : undefined);
+
+    try {
+        const item = await findOwnedItem(id, user.id);
+        if (!item) {
+            return notFound("Item not found");
+        }
+        if (!item.questionText?.trim()) {
+            return badRequest("NO_QUESTION_TEXT");
+        }
+
+        const questionText = item.questionText;
+        // 按目标防重复：同一错题同一语言同一时刻只允许一个「生成动画讲解」任务（reserve 失败返回 409，不扣额度、不调用 AI）
+        const target = `error-item:${id}:svg-animation:${language}`;
+        const handle = reserveBackgroundTask({
+            userId: user.id,
+            kind: 'svg_animation',
+            subject: describeQuestion(item),
+            link: `/error-items/${id}`,
+            target,
+        });
+        if (!handle) {
+            return taskAlreadyRunning(findRunningTask(user.id, target) ?? { id: '', kind: 'svg_animation', startedAt: '', target });
+        }
+
+        const limited = await serializeWrite(() => consumeAiQuota(user, 'animation'));
+        if (limited) {
+            handle.cancel();
+            return limited;
+        }
+
+        // 页面关闭后服务端仍会继续生成并保存，后台任务弹框中可查看进度
+        const svgAnimation = await runReservedTask(handle, async () => {
+            const svg = await (await getAIService({ userId: user.id, kind: 'animation' })).generateSvgAnimation(questionText, item.answerText || "", item.analysis || "", item.figureSvg, language);
+            if (!svg) throw new Error("NO_VALID_ANIMATION");
+            await prisma.errorItem.update({ where: { id }, data: { [animationField(language)]: svg } });
+            return svg;
+        }).catch((error: unknown) => {
+            if (error instanceof Error && error.message === "NO_VALID_ANIMATION") return null;
+            throw error;
+        });
+        if (!svgAnimation) {
+            return badRequest("NO_VALID_ANIMATION");
+        }
+
+        logger.info({ errorItemId: id, language, svgLength: svgAnimation.length }, 'SVG animation generated');
+        return NextResponse.json({ svgAnimation, language });
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.error({ error: message }, 'Error generating SVG animation');
+        // AI 错误码交给前端映射为提示文案
+        return internalError(message.startsWith('AI_') ? message.split(':')[0] : "Failed to generate SVG animation");
+    }
+}
+
+/**
+ * DELETE /api/error-items/:id/svg-animation?language=zh|en
+ * 删除指定语言已生成的 SVG 动画讲解，另一语言的动画保留；未指定时为中文
+ */
+export const DELETE = withUser(async (req: Request, { user, params }: RouteContext & AuthenticatedContext) => {
+    const { id } = await params;
+    const language = parseLanguage(new URL(req.url).searchParams.get('language'));
+
+    try {
+        if (!await findOwnedItem(id, user.id)) {
+            return notFound("Item not found");
+        }
+
+        await prisma.errorItem.update({ where: { id }, data: { [animationField(language)]: null } });
+        logger.info({ errorItemId: id, language }, 'SVG animation deleted');
+        return NextResponse.json({ success: true });
+    } catch (error) {
+        logger.error({ error }, 'Error deleting SVG animation');
+        return internalError("Failed to delete SVG animation");
+    }
+});
+
+/** 耗时 AI 请求：浏览器中断连接后，前端可通过 /api/requests/:id 取回响应 */
+export const POST = withRecoverableResponse(withUser(handlePost));

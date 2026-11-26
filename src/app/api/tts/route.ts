@@ -1,0 +1,49 @@
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { withUser } from "@/lib/api-handler";
+import type { AuthenticatedContext } from "@/lib/api-handler";
+import { badRequest } from "@/lib/api-errors";
+import { getTtsMode, synthesizeSpeech } from "@/lib/tts/speech-cache";
+import { speechErrorResponse, speechLanguageSchema, speechTextSchema } from "@/lib/tts/request";
+import { withRecoverableResponse } from "@/lib/recoverable-response";
+
+export const dynamic = 'force-dynamic';
+
+const bodySchema = z.object({
+    text: speechTextSchema,
+    language: speechLanguageSchema,
+    /** 忽略缓存重新合成 */
+    regenerate: z.boolean().optional(),
+});
+
+/**
+ * GET /api/tts
+ * 当前的朗读方式：{ mode: 'browser' | 'cloud' }，播放器据此选择浏览器语音或云端语音
+ */
+export const GET = withUser(async () => {
+    const ttsMode = getTtsMode();
+    // ttsMode 只是渠道名（如 minimax），不含密钥；前端用于匿名统计朗读方式
+    return NextResponse.json({ mode: ttsMode === 'browser' ? 'browser' : 'cloud', ttsMode });
+});
+
+/**
+ * POST /api/tts
+ * 用云端语音合成朗读一段讲解，请求体 { text, language, regenerate? }，返回 { id, version }，
+ * 音频用 GET /api/tts/:id?v=version 获取。同样的文字只合成一次，regenerate 为 true 时重新合成；
+ * 当前为浏览器本地语音时返回 TTS_DISABLED。整个动画的语音用 POST /api/tts/batch 合成
+ */
+async function handlePost(req: Request, { user }: AuthenticatedContext) {
+    const parsed = bodySchema.safeParse(await req.json().catch(() => null));
+    if (!parsed.success) {
+        return badRequest("INVALID_TTS_TEXT");
+    }
+    try {
+        const result = await synthesizeSpeech(parsed.data.text, parsed.data.language, { regenerate: parsed.data.regenerate });
+        if (!result) return badRequest("TTS_DISABLED");
+        return NextResponse.json(result);
+    } catch (error) {
+        return speechErrorResponse(error, user);
+    }
+}
+
+export const POST = withRecoverableResponse(withUser(handlePost));

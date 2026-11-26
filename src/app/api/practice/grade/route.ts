@@ -1,0 +1,75 @@
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { getAIService } from "@/lib/ai";
+import { withUser } from "@/lib/api-handler";
+import type { AuthenticatedContext } from "@/lib/api-handler";
+import { internalError, notFound, validationError } from "@/lib/api-errors";
+import { parseLastPractice } from "@/lib/last-practice";
+import { createLogger } from "@/lib/logger";
+import { prisma } from "@/lib/prisma";
+import { consumeAiQuota } from "@/lib/ai-quota";
+import { withRecoverableResponse } from "@/lib/recoverable-response";
+import { trackPracticeGrading } from "@/lib/telemetry/events";
+
+const logger = createLogger('api:practice:grade');
+
+const gradeSchema = z.object({
+    errorItemId: z.string().min(1).optional(),
+    practiceQuestionId: z.string().min(1).optional(),
+    userAnswer: z.string().trim().min(1).max(5000),
+    language: z.enum(['zh', 'en']).optional(),
+});
+
+/**
+ * POST /api/practice/grade
+ * 由 AI 对照该错题最近一次生成的举一反三题目判定学生答案。
+ * 题目和标准答案取自服务端暂存，不信任客户端传入的答案。
+ */
+async function handlePost(req: Request, { user }: AuthenticatedContext) {
+    try {
+        const parsed = gradeSchema.safeParse(await req.json());
+        if (!parsed.success) {
+            return validationError("Invalid grading request", parsed.error.issues);
+        }
+        const { errorItemId, practiceQuestionId, userAnswer, language } = parsed.data;
+
+        // 历史题直接读取已保存的题目与答案；旧流程仍读取错题的最近一次生成结果
+        let practice: { questionText: string; answerText: string; analysis: string } | null = null;
+        if (practiceQuestionId) {
+            const stored = await prisma.practiceQuestion.findUnique({
+                where: { id: practiceQuestionId },
+                select: { userId: true, questionText: true, answerText: true, analysis: true },
+            });
+            practice = stored && stored.userId === user.id
+                ? { questionText: stored.questionText, answerText: stored.answerText, analysis: stored.analysis }
+                : null;
+        } else if (errorItemId) {
+            const item = await prisma.errorItem.findUnique({
+                where: { id: errorItemId },
+                select: { userId: true, lastPractice: true },
+            });
+            practice = item && item.userId === user.id ? parseLastPractice(item.lastPractice) : null;
+        }
+        if (!practice) {
+            return notFound("Practice question not found");
+        }
+
+        const limited = await consumeAiQuota(user, 'grade');
+        if (limited) return limited;
+
+        const result = await trackPracticeGrading(async () => (await getAIService({ userId: user.id, kind: 'grade' })).gradeAnswer({
+            questionText: practice.questionText,
+            answerText: practice.answerText,
+            analysis: practice.analysis,
+            userAnswer,
+            language,
+        }));
+        return NextResponse.json(result);
+    } catch (error) {
+        logger.error({ error }, 'Error grading answer');
+        return internalError(error instanceof Error ? error.message : "Failed to grade answer", { error, scope: "api:practice" });
+    }
+}
+
+/** 耗时 AI 请求：浏览器中断连接后，前端可通过 /api/requests/:id 取回响应 */
+export const POST = withRecoverableResponse(withUser(handlePost));

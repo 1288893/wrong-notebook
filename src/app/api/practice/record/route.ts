@@ -1,0 +1,132 @@
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { prisma } from "@/lib/prisma";
+import { withUser } from "@/lib/api-handler";
+import type { AuthenticatedContext } from "@/lib/api-handler";
+import { internalError, notFound, validationError } from "@/lib/api-errors";
+import { createLogger } from "@/lib/logger";
+import { PRACTICE_RESULTS, scheduleMasteryEvaluation } from "@/lib/mastery";
+import { masteryLevelOf } from "@/lib/mastery-status";
+import { MAX_FIGURE_SVG_LENGTH, sanitizeFigureSvg } from "@/lib/figure-svg";
+
+const logger = createLogger('api:practice:record');
+
+const recordSchema = z.object({
+    errorItemId: z.string().min(1).optional(),
+    practiceQuestionId: z.string().min(1).optional(),
+    result: z.enum(PRACTICE_RESULTS as [string, ...string[]]).optional(),
+    isCorrect: z.boolean().nullable().optional(),
+    subject: z.string().max(50).nullable().optional(),
+    difficulty: z.string().max(20).nullable().optional(),
+    questionText: z.string().max(20000).nullable().optional(),
+    answerText: z.string().max(20000).nullable().optional(),
+    analysis: z.string().max(50000).nullable().optional(),
+    mistakeAnalysis: z.string().max(50000).nullable().optional(),
+    figureSvg: z.string().max(MAX_FIGURE_SVG_LENGTH).nullable().optional(),
+    // manual：在错题详情中直接录入结果，不附带新题；review：在今日复习中按顺序作答
+    source: z.enum(['practice', 'manual', 'review']).optional(),
+    takenAt: z.string().datetime({ offset: true }).optional(),
+});
+
+async function handlePost(req: Request, { user }: AuthenticatedContext) {
+    try {
+        const parsed = recordSchema.safeParse(await req.json());
+        if (!parsed.success) {
+            return validationError("Invalid practice record", parsed.error.issues);
+        }
+        let errorItemId = parsed.data.errorItemId;
+        const practiceQuestionId = parsed.data.practiceQuestionId;
+        let { difficulty, questionText, answerText, analysis } = parsed.data;
+        const mistakeAnalysis = parsed.data.mistakeAnalysis;
+        let questionFigureSvg: string | null = null;
+        let subject = parsed.data.subject;
+        const source = parsed.data.source ?? 'practice';
+        const figureSvg = sanitizeFigureSvg(parsed.data.figureSvg);
+        // 兼容旧客户端只传 isCorrect 的情况
+        const result = parsed.data.result
+            ?? (parsed.data.isCorrect === true ? 'correct' : parsed.data.isCorrect === false ? 'wrong' : undefined);
+
+        const userId = user.id;
+
+        // 历史题作答：校验题目归属，并从题目补齐原题、学科与难度
+        if (practiceQuestionId) {
+            const question = await prisma.practiceQuestion.findUnique({
+                where: { id: practiceQuestionId },
+                select: { userId: true, errorItemId: true, subject: true, difficulty: true, questionText: true, answerText: true, analysis: true, figureSvg: true },
+            });
+            if (!question || question.userId !== userId) {
+                return notFound("Practice question not found");
+            }
+            if (errorItemId && question.errorItemId && errorItemId !== question.errorItemId) {
+                return validationError("Practice question does not belong to this item", [{ code: 'mismatch', path: ['practiceQuestionId'], message: 'Mismatched error item' }]);
+            }
+            errorItemId ??= question.errorItemId ?? undefined;
+            subject ??= question.subject;
+            difficulty ??= question.difficulty;
+            questionText ??= question.questionText;
+            answerText ??= question.answerText;
+            analysis ??= question.analysis;
+            questionFigureSvg = sanitizeFigureSvg(question.figureSvg);
+        }
+
+        // 关联原题时校验归属，防止写入他人的错题
+        if (errorItemId) {
+            const item = await prisma.errorItem.findUnique({
+                where: { id: errorItemId },
+                select: { userId: true, subject: { select: { name: true } } },
+            });
+            if (!item || item.userId !== userId) {
+                return notFound("Item not found");
+            }
+            subject ??= item.subject?.name ?? null;
+        }
+
+        const isCorrect = result ? result === 'correct' : parsed.data.isCorrect;
+
+        const record = await prisma.practiceRecord.create({
+            data: {
+                userId,
+                subject,
+                difficulty,
+                isCorrect,
+                ...(practiceQuestionId ? { practiceQuestionId } : {}),
+                ...(errorItemId ? { errorItemId } : {}),
+                ...((errorItemId || practiceQuestionId) ? {
+                    result,
+                    questionText,
+                    answerText,
+                    analysis,
+                    mistakeAnalysis,
+                    figureSvg: figureSvg ?? questionFigureSvg,
+                    source,
+                } : {}),
+                ...(parsed.data.takenAt ? { createdAt: new Date(parsed.data.takenAt) } : {}),
+            },
+        });
+
+        if (errorItemId && result) {
+            if (source === 'review' && result === 'correct') {
+                // 顺序复习中明确做对，直接标记为已掌握，不必等待后台评估
+                await prisma.errorItem.update({
+                    where: { id: errorItemId },
+                    data: {
+                        masteryProbability: 1,
+                        masteryLevel: masteryLevelOf('mastered'),
+                        masterySource: 'rule',
+                        masteryReason: '顺序复习做对，标记为已掌握',
+                        masteryEvaluatedAt: new Date(),
+                    },
+                });
+            } else {
+                scheduleMasteryEvaluation([errorItemId]);
+            }
+        }
+
+        return NextResponse.json(record);
+    } catch (error) {
+        logger.error({ error }, 'Error saving practice record');
+        return internalError("Failed to save record", { error, scope: "api:practice" });
+    }
+}
+
+export const POST = withUser(handlePost);

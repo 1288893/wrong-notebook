@@ -1,0 +1,43 @@
+"use client";
+
+import { useEffect } from "react";
+import { LanguageProvider } from "@/contexts/LanguageContext";
+import { SessionProvider } from "next-auth/react";
+import { ThemeProvider } from "@/contexts/ThemeContext";
+import { MobileNavProvider } from "@/contexts/MobileNavContext";
+import { QuestionNumberingProvider } from "@/contexts/QuestionNumberingContext";
+import { TimeZoneProvider } from "@/contexts/TimeZoneContext";
+import { AiConsentDialog } from "@/components/ai-consent-dialog";
+import { AppShell } from "@/components/app-shell";
+import { BackgroundTasksButton } from "@/components/background-tasks-button";
+import { OutdatedBrowserNotice } from "@/components/outdated-browser-notice";
+import { FeedbackHost } from "@/components/ui/feedback-host";
+import { ServiceWorkerRegister } from "@/components/service-worker-register";
+import { installGlobalErrorLogging } from "@/lib/frontend-logger";
+import type { QuestionNumbering } from "@/lib/seq-no/seq-no-format";
+
+export function Providers({ children, timeZone, questionNumbering }: { children: React.ReactNode; timeZone?: string; questionNumbering?: QuestionNumbering }) {
+    // 未捕获的前端异常上报到服务端日志，调试模式下可随调试日志导出
+    useEffect(() => installGlobalErrorLogging(), []);
+
+    return (
+        <SessionProvider>
+            <ThemeProvider>
+                <MobileNavProvider>
+                    <LanguageProvider>
+                        <TimeZoneProvider initialTimeZone={timeZone}>
+                            <QuestionNumberingProvider initialNumbering={questionNumbering}>
+                                <OutdatedBrowserNotice />
+                                <AppShell>{children}</AppShell>
+                                <BackgroundTasksButton />
+                                <AiConsentDialog />
+                                <FeedbackHost />
+                                <ServiceWorkerRegister />
+                            </QuestionNumberingProvider>
+                        </TimeZoneProvider>
+                    </LanguageProvider>
+                </MobileNavProvider>
+            </ThemeProvider>
+        </SessionProvider>
+    );
+}

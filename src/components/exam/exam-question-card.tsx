@@ -1,0 +1,192 @@
+"use client";
+
+import { useState } from "react";
+import Link from "next/link";
+import { useTimeZone } from "@/contexts/TimeZoneContext";
+import { formatDateTime } from "@/lib/date-time";
+import { ChevronDown, ChevronUp, Loader2, X } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent } from "@/components/ui/card";
+import { MarkdownRenderer } from "@/components/markdown-renderer";
+import { RESULT_BADGE_CLASS } from "@/components/mastery-panel";
+import { PracticeResultPicker } from "@/components/practice-result-picker";
+import { QuestionFigure } from "@/components/question-figure";
+import { FigureScaleEditor } from "@/components/error-detail/figure-scale-editor";
+import { ExamQuestionRegenerate } from "@/components/exam/exam-question-regenerate";
+import { ExamQuestionScoreInput } from "@/components/exam/exam-question-score-input";
+import { useLanguage } from "@/contexts/LanguageContext";
+import { useQuestionNo } from "@/contexts/QuestionNumberingContext";
+import { stripFigureDescriptions } from "@/lib/question/question-similarity";
+import type { FigureAlign } from "@/lib/figure-scale";
+import type { ExamMode, ExamQuestionDetail, PracticeResult } from "@/types/api";
+
+interface ExamQuestionCardProps {
+    paperId: string;
+    paperMode?: ExamMode;
+    question: ExamQuestionDetail;
+    /** 显示题号；缺省用卷内 order。按题型分大题时为全卷连续编号 */
+    displayNumber?: number;
+    /** 录入模式下的待保存结果；undefined 表示非录入模式 */
+    editingResult?: PracticeResult | null;
+    onResultChange?: (result: PracticeResult) => void;
+    /** 录入模式下删除某次已录入的结果 */
+    onDeleteAttempt?: (attemptId: string) => void;
+    /** 单题重新生成完成后回调 */
+    onRegenerated?: () => void;
+    /** 统一调整全卷配图比例时的临时预览值 */
+    previewFigureScale?: number | null;
+    /** 统一调整全卷配图位置时的临时预览值 */
+    previewFigureAlign?: FigureAlign | null;
+    /** 单题保存配图显示与打印比例、位置 */
+    onSaveFigureScale?: (questionId: string, figureScale: number, figureAlign: FigureAlign) => Promise<void>;
+    /** 单题切换配图来源（原图 / AI 重绘） */
+    onSaveFigureSource?: (questionId: string, source: 'svg' | 'image') => Promise<void>;
+    /** 单题保存分值；null 表示清空该题分值 */
+    onSaveScore?: (questionId: string, score: number | null) => Promise<void>;
+}
+
+export function ExamQuestionCard({
+    paperId,
+    paperMode,
+    question,
+    displayNumber,
+    editingResult,
+    onResultChange,
+    onDeleteAttempt,
+    onRegenerated,
+    previewFigureScale,
+    previewFigureAlign,
+    onSaveFigureScale,
+    onSaveFigureSource,
+    onSaveScore,
+}: ExamQuestionCardProps) {
+    const { t } = useLanguage();
+    const { timeZone } = useTimeZone();
+    const questionNo = useQuestionNo();
+    const sourceNo = questionNo({ shortId: question.sourceShortId, seqNo: question.sourceSeqNo }) ?? question.sourceShortId;
+    const [showAnswer, setShowAnswer] = useState(false);
+    const isEditing = editingResult !== undefined;
+    // AI 错误码（如 AI_AUTH_ERROR: ...）映射为界面提示
+    const errorText = (() => {
+        if (!question.error) return "";
+        if (question.error === "SOURCE_DELETED") return t.exam.sourceDeleted;
+        const code = question.error.split(":")[0].trim();
+        const mapped = (t.errors as Record<string, unknown>)[code];
+        return typeof mapped === "string" ? mapped : question.error;
+    })();
+
+    return (
+        <Card>
+            <CardContent className="space-y-3 pt-4">
+                <div className="flex flex-wrap items-center gap-2 text-sm">
+                    <span className="font-semibold">{displayNumber ?? question.order}.</span>
+                    {question.errorItemId ? (
+                        <Link href={`/error-items/${question.errorItemId}`} className="font-mono text-xs text-primary hover:underline">
+                            {t.exam.source} {sourceNo}
+                        </Link>
+                    ) : (
+                        <span className="font-mono text-xs text-muted-foreground">
+                            {sourceNo} · {t.exam.sourceDeleted}
+                        </span>
+                    )}
+                    {question.notebookName && <Badge variant="secondary">{question.notebookName}</Badge>}
+                    {onSaveScore && (
+                        <span className="ml-auto">
+                            <ExamQuestionScoreInput
+                                questionId={question.id}
+                                score={question.score ?? null}
+                                disabled={isEditing}
+                                onSave={onSaveScore}
+                            />
+                        </span>
+                    )}
+                </div>
+
+                {question.attempts.length > 0 && (
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                        {question.attempts.map((attempt, index) => (
+                            <Badge key={attempt.id} variant="outline" className={`gap-1 font-normal ${RESULT_BADGE_CLASS[attempt.result] || ""}`}>
+                                <span>{t.exam.attemptLabel.replace("{n}", String(index + 1))}</span>
+                                <span className="tabular-nums">{formatDateTime(attempt.createdAt, "MM-dd", timeZone)}</span>
+                                <span className="font-semibold">{t.mastery.results[attempt.result]}</span>
+                                {isEditing && onDeleteAttempt && (
+                                    <button
+                                        type="button"
+                                        aria-label={t.mastery.deleteRecord}
+                                        className="-mr-1 rounded hover:bg-black/10"
+                                        onClick={() => onDeleteAttempt(attempt.id)}
+                                    >
+                                        <X className="h-3 w-3" />
+                                    </button>
+                                )}
+                            </Badge>
+                        ))}
+                    </div>
+                )}
+
+                {question.status === "pending" && (
+                    <p className="flex items-center gap-2 text-sm text-muted-foreground">
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        {t.exam.questionPending}
+                    </p>
+                )}
+                {question.status === "failed" && (
+                    <p className="text-sm text-destructive">{t.exam.questionFailed}{errorText ? `${t.common.colon}${errorText}` : ""}</p>
+                )}
+                {question.status === "ready" && question.questionText && (
+                    <>
+                        <MarkdownRenderer content={question.figureSvg || question.figureImage
+                            ? stripFigureDescriptions(question.questionText)
+                            : question.questionText} />
+                        {onSaveFigureScale ? (
+                            <FigureScaleEditor
+                                key={`${question.id}-${question.figureScale ?? 100}-${question.figureAlign ?? "center"}-${question.figureSource ?? "svg"}`}
+                                svg={question.figureSvg}
+                                image={question.figureImage}
+                                source={question.figureSource}
+                                scale={question.figureScale}
+                                align={question.figureAlign}
+                                previewScaleOverride={previewFigureScale}
+                                previewAlignOverride={previewFigureAlign}
+                                onSave={(figureScale, figureAlign) => onSaveFigureScale(question.id, figureScale, figureAlign)}
+                                onSaveSource={onSaveFigureSource
+                                    ? (source) => onSaveFigureSource(question.id, source)
+                                    : undefined}
+                            />
+                        ) : (
+                            <QuestionFigure
+                                svg={question.figureSvg}
+                                image={question.figureImage}
+                                source={question.figureSource}
+                                scale={previewFigureScale ?? question.figureScale}
+                                align={previewFigureAlign ?? question.figureAlign}
+                            />
+                        )}
+                        <button
+                            type="button"
+                            className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+                            onClick={() => setShowAnswer(!showAnswer)}
+                        >
+                            {showAnswer ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+                            {t.exam.showAnswer}
+                        </button>
+                        {showAnswer && (
+                            <div className="space-y-2 rounded-md bg-muted/40 p-3">
+                                {question.answerText && <MarkdownRenderer content={question.answerText} className="font-semibold" />}
+                                {question.analysis && <MarkdownRenderer content={question.analysis} />}
+                            </div>
+                        )}
+                    </>
+                )}
+
+                {!isEditing && onRegenerated && (
+                    <ExamQuestionRegenerate paperId={paperId} paperMode={paperMode} question={question} onDone={onRegenerated} />
+                )}
+
+                {isEditing && question.status === "ready" && question.errorItemId && onResultChange && (
+                    <PracticeResultPicker value={editingResult} onChange={onResultChange} size="sm" />
+                )}
+            </CardContent>
+        </Card>
+    );
+}

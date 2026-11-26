@@ -1,0 +1,379 @@
+/**
+ * 后台耗时事务登记：识别题目、生成动画讲解、重新解题、批量标注、生成试卷等调用 AI 的操作
+ * 开始时登记，结束时标记成功或失败，供页面「后台任务」弹框查询进度。
+ *
+ * 登记表保存在进程内存中（生产环境为单个容器），并在变化后写入配置目录的 background-tasks.json：
+ * 服务重启后仍能看到最近结束的事务；重启时还在进行的事务（AI 调用已随进程中断）标记为失败，提示用户重新操作。
+ * 已结束的事务保留一段时间后自动清理。
+ *
+ * 「按目标防重复」约定：同一用户对同一个操作目标，同一时刻只允许一个 running 事务。
+ * target 命名约定为 `<对象类型>:<id>:<动作>`，全小写、冒号分隔，例如：
+ *   - import-batch:abc123:fix-text    分题预览的「AI 修正文字」
+ *   - error-item:xyz:reanswer        重新解题
+ *   - error-item:xyz:svg-animation   生成动画讲解
+ * 服务端用 reserveBackgroundTask 预占：检查与登记之间没有 await，并发请求只有一个成功；
+ * 额度不足等原因放弃时调用 handle.cancel() 撤下预占，不留下失败记录；
+ * 之后用 runReservedTask 包装执行，结束时会自动 succeed/fail。
+ * 前端用 useRunningTask(target) 查询同 target 的进行中任务、禁用按钮，收到 TASK_ALREADY_RUNNING 时
+ * 调用 backgroundTaskStore.refresh() 取回任务状态并等待。详见 doc/BACKGROUND_TASKS.md。
+ */
+
+import "server-only";
+
+import fs from "node:fs";
+import path from "node:path";
+import { createLogger } from "@/lib/logger";
+
+const logger = createLogger('background-tasks');
+
+export type BackgroundTaskKind =
+    | 'analyze'          // 识别题目图片
+    | 'split'            // 多题分题
+    | 'fix_text'         // 修正分题预览中的题目文字
+    | 'batch_upload'     // Openclaw 批量上传识别
+    | 'data_import'      // 导入备份数据
+    | 'svg_animation'    // 生成 SVG 动画讲解
+    | 'svg_narration'    // 补写动画的语音讲解稿
+    | 'tts_voice'        // 合成动画讲解的云端语音
+    | 'reanswer'         // 重新生成解答
+    | 'fix_latex'        // 修复 LaTeX
+    | 'figure'           // 重绘配图
+    | 'geogebra'         // 生成 GeoGebra 演示
+    | 'retag'            // 重新生成知识点（单题）
+    | 'retag_notebook'   // 错题本批量重新生成知识点
+    | 'practice'         // 生成举一反三题目
+    | 'exam';            // 生成试卷
+
+export type BackgroundTaskStatus = 'running' | 'succeeded' | 'failed';
+
+export interface BackgroundTask {
+    id: string;
+    kind: BackgroundTaskKind;
+    /** 操作对象的说明，如题目编号和题干开头、错题本名、试卷标题 */
+    subject: string | null;
+    status: BackgroundTaskStatus;
+    /** 批量事务的进度 */
+    progress: { done: number; total: number; failed: number } | null;
+    error: string | null;
+    /** 可跳转查看的页面 */
+    link: string | null;
+    /** 操作对象标识，格式 `<对象类型>:<id>:<动作>`；同一用户同一 target 同时只允许一个 running 任务 */
+    target: string | null;
+    startedAt: string;
+    finishedAt: string | null;
+}
+
+interface StoredTask extends BackgroundTask {
+    userId: string;
+}
+
+export interface BackgroundTaskInput {
+    userId: string;
+    kind: BackgroundTaskKind;
+    subject?: string | null;
+    link?: string | null;
+    total?: number;
+    /** 操作对象标识：`<对象类型>:<id>:<动作>`；提供后按 target 防重复（reserveBackgroundTask） */
+    target?: string | null;
+}
+
+/** reserveBackgroundTask 的入参：target 必填 */
+export type ReservedTaskInput = BackgroundTaskInput & { target: string };
+
+export interface BackgroundTaskHandle {
+    id: string;
+    /** 预占的 target；普通 startBackgroundTask 为 null */
+    target: string | null;
+    setProgress: (done: number, total?: number, failed?: number) => void;
+    succeed: () => void;
+    fail: (error: unknown) => void;
+    /** 预占后未真正开始（额度不足等）时撤下登记，不留任何记录 */
+    cancel: () => void;
+}
+
+/** 已结束的事务保留时长 */
+export const FINISHED_TASK_TTL_MS = 30 * 60 * 1000;
+/** 每个用户最多保留的已结束事务数 */
+const MAX_FINISHED_PER_USER = 30;
+
+/** 服务重启时仍在进行的事务记录的错误码 */
+export const SERVER_RESTARTED = 'SERVER_RESTARTED';
+/** 进度频繁变化时合并写盘的间隔 */
+const SAVE_DELAY_MS = 1000;
+
+// 开发环境热更新会重新加载模块，挂在 globalThis 上保持同一份登记表
+const store = globalThis as typeof globalThis & {
+    __backgroundTasks?: Map<string, StoredTask>;
+    __backgroundTasksLoaded?: boolean;
+    __backgroundTasksFile?: string | null;
+};
+const tasks: Map<string, StoredTask> = store.__backgroundTasks ??= new Map();
+
+let sequence = 0;
+let saveTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** 持久化文件路径；测试环境默认不写盘 */
+function persistenceFile(): string | null {
+    if (store.__backgroundTasksFile !== undefined) return store.__backgroundTasksFile;
+    if (process.env.NODE_ENV === 'test') return null;
+    return path.join(process.env.CONFIG_DIR || path.join(process.cwd(), 'config'), 'background-tasks.json');
+}
+
+function isStoredTask(value: unknown): value is StoredTask {
+    if (typeof value !== 'object' || value === null) return false;
+    const task = value as Partial<StoredTask>;
+    return typeof task.id === 'string' && typeof task.userId === 'string' && typeof task.kind === 'string'
+        && typeof task.status === 'string' && typeof task.startedAt === 'string';
+}
+
+/** 首次访问时读取上次保存的登记表，把当时进行中的事务标记为因重启中断 */
+function ensureLoaded() {
+    if (store.__backgroundTasksLoaded) return;
+    store.__backgroundTasksLoaded = true;
+    const file = persistenceFile();
+    if (!file) return;
+    let saved: unknown;
+    try {
+        saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') logger.warn({ error }, 'Failed to read saved background tasks');
+        return;
+    }
+    if (!Array.isArray(saved)) return;
+    const now = new Date().toISOString();
+    let interrupted = 0;
+    for (const task of saved.filter(isStoredTask)) {
+        if (tasks.has(task.id)) continue;
+        if (task.status === 'running') {
+            task.status = 'failed';
+            task.error = SERVER_RESTARTED;
+            task.finishedAt = now;
+            interrupted++;
+        }
+        tasks.set(task.id, task);
+    }
+    if (interrupted > 0) {
+        logger.info({ interrupted }, 'Marked background tasks interrupted by restart as failed');
+        scheduleSave();
+    }
+}
+
+function saveNow() {
+    saveTimer = null;
+    const file = persistenceFile();
+    if (!file) return;
+    try {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        // 先写临时文件再改名，避免写到一半时进程退出留下损坏的文件
+        const temp = `${file}.${process.pid}.tmp`;
+        fs.writeFileSync(temp, JSON.stringify([...tasks.values()]));
+        fs.renameSync(temp, file);
+    } catch (error) {
+        logger.warn({ error }, 'Failed to save background tasks');
+    }
+}
+
+function scheduleSave() {
+    if (saveTimer || !persistenceFile()) return;
+    saveTimer = setTimeout(saveNow, SAVE_DELAY_MS);
+    // 不因待写盘的定时器阻止进程退出
+    saveTimer.unref?.();
+}
+
+function prune(now: number) {
+    ensureLoaded();
+    let removed = false;
+    for (const [id, task] of tasks) {
+        if (task.finishedAt && now - Date.parse(task.finishedAt) > FINISHED_TASK_TTL_MS) {
+            tasks.delete(id);
+            removed = true;
+        }
+    }
+    if (removed) scheduleSave();
+}
+
+function errorMessage(error: unknown): string {
+    const message = error instanceof Error ? error.message : String(error);
+    // AI 错误码形如 AI_RESPONSE_ERROR: 详情，只保留错误码交给前端翻译
+    return (message.startsWith('AI_') ? message.split(':')[0] : message).slice(0, 200);
+}
+
+/** 内部：登记一个后台事务并返回句柄；target 由调用方决定 */
+function createTask(input: BackgroundTaskInput, target: string | null): BackgroundTaskHandle {
+    const now = Date.now();
+    prune(now);
+    const id = `${now.toString(36)}-${(sequence++).toString(36)}`;
+    const task: StoredTask = {
+        id,
+        userId: input.userId,
+        kind: input.kind,
+        subject: input.subject ?? null,
+        status: 'running',
+        progress: input.total !== undefined ? { done: 0, total: input.total, failed: 0 } : null,
+        error: null,
+        link: input.link ?? null,
+        target,
+        startedAt: new Date(now).toISOString(),
+        finishedAt: null,
+    };
+    tasks.set(id, task);
+    scheduleSave();
+
+    let cancelled = false;
+    const finish = (status: BackgroundTaskStatus, error: string | null) => {
+        if (task.status !== 'running') return;
+        task.status = status;
+        task.error = error;
+        task.finishedAt = new Date().toISOString();
+        scheduleSave();
+    };
+    return {
+        id,
+        target,
+        setProgress: (done, total, failed) => {
+            if (cancelled) return;
+            task.progress = { done, total: total ?? task.progress?.total ?? done, failed: failed ?? task.progress?.failed ?? 0 };
+            scheduleSave();
+        },
+        succeed: () => {
+            if (cancelled) return;
+            finish('succeeded', null);
+        },
+        fail: (error) => {
+            if (cancelled) return;
+            finish('failed', errorMessage(error));
+            logger.debug({ taskId: id, kind: task.kind, error: task.error }, 'Background task failed');
+        },
+        cancel: () => {
+            // 预占后未真正开始：直接删除登记，不留失败记录
+            cancelled = true;
+            tasks.delete(id);
+            scheduleSave();
+        },
+    };
+}
+
+/** 登记一个后台事务 */
+export function startBackgroundTask(input: BackgroundTaskInput): BackgroundTaskHandle {
+    return createTask(input, input.target ?? null);
+}
+
+/**
+ * 预占一个后台事务：同一用户同一 target 已有 running 任务时返回 null，
+ * 否则同步登记（检查与登记之间没有 await，并发请求只有一个成功）并返回句柄。
+ * 之后用 runReservedTask 包装执行；未真正开始时调用 handle.cancel() 撤下登记。
+ */
+export function reserveBackgroundTask(input: ReservedTaskInput): BackgroundTaskHandle | null {
+    ensureLoaded();
+    prune(Date.now());
+    const existing = findRunningTask(input.userId, input.target);
+    if (existing) return null;
+    return createTask(input, input.target);
+}
+
+/**
+ * 在预占句柄上执行 operation：正常返回标记成功，抛错标记失败后继续抛出。
+ * 路由三步写法：reserveBackgroundTask → consumeAiQuota → runReservedTask。
+ */
+export async function runReservedTask<T>(handle: BackgroundTaskHandle, operation: (task: BackgroundTaskHandle) => Promise<T>): Promise<T> {
+    try {
+        const result = await operation(handle);
+        handle.succeed();
+        return result;
+    } catch (error) {
+        handle.fail(error);
+        throw error;
+    }
+}
+
+/** 查询当前用户在指定 target 上正在运行的任务（含用户级查询，供路由复用） */
+export function findRunningTask(userId: string, target: string): BackgroundTask | null {
+    ensureLoaded();
+    for (const task of tasks.values()) {
+        if (task.userId === userId && task.target === target && task.status === 'running') {
+            return {
+                id: task.id,
+                kind: task.kind,
+                subject: task.subject,
+                status: task.status,
+                progress: task.progress && { ...task.progress },
+                error: task.error,
+                link: task.link,
+                target: task.target,
+                startedAt: task.startedAt,
+                finishedAt: task.finishedAt,
+            };
+        }
+    }
+    return null;
+}
+
+/**
+ * 登记事务并执行 operation：正常返回标记成功，抛错标记失败后继续抛出。
+ * 按 target 防重复的路由请改用 reserveBackgroundTask + runReservedTask（见文件顶部注释）。
+ */
+export async function trackBackgroundTask<T>(input: BackgroundTaskInput, operation: (task: BackgroundTaskHandle) => Promise<T>): Promise<T> {
+    return runReservedTask(startBackgroundTask(input), operation);
+}
+
+/**
+ * 当前用户的事务：进行中的在前（按开始时间），其后是最近结束的
+ */
+export function listBackgroundTasks(userId: string): BackgroundTask[] {
+    prune(Date.now());
+    const own = [...tasks.values()].filter((task) => task.userId === userId);
+    const running = own.filter((task) => task.status === 'running')
+        .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+    const finished = own.filter((task) => task.status !== 'running')
+        .sort((a, b) => (b.finishedAt ?? '').localeCompare(a.finishedAt ?? ''))
+        .slice(0, MAX_FINISHED_PER_USER);
+    return [...running, ...finished].map((task) => ({
+        id: task.id,
+        kind: task.kind,
+        subject: task.subject,
+        status: task.status,
+        progress: task.progress && { ...task.progress },
+        error: task.error,
+        link: task.link,
+        target: task.target,
+        startedAt: task.startedAt,
+        finishedAt: task.finishedAt,
+    }));
+}
+
+/** 清除当前用户已结束的事务记录 */
+export function clearFinishedBackgroundTasks(userId: string): void {
+    ensureLoaded();
+    for (const [id, task] of tasks) {
+        if (task.userId === userId && task.status !== 'running') tasks.delete(id);
+    }
+    scheduleSave();
+}
+
+/** 题目的简短说明：编号 + 题干开头（去掉公式符号和换行） */
+export function describeQuestion(item: { shortId?: string | null; questionText?: string | null }): string {
+    const text = (item.questionText ?? '')
+        .replace(/\$+/g, '')
+        .replace(/\\[a-zA-Z]+|[{}\\]/g, ' ')
+        .replace(/[#*>`|_-]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/\s*([，。；：？！、])\s*/g, '$1')
+        .trim();
+    const excerpt = text.length > 24 ? `${text.slice(0, 24)}…` : text;
+    return [item.shortId, excerpt].filter(Boolean).join(' ') || '—';
+}
+
+/** 仅供测试：清空登记表；可指定持久化文件，模拟服务重启后重新读取 */
+export function resetBackgroundTasksForTest(options: { file?: string | null } = {}): void {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
+    tasks.clear();
+    store.__backgroundTasksFile = options.file === undefined ? null : options.file;
+    store.__backgroundTasksLoaded = false;
+}
+
+/** 仅供测试：立即写盘 */
+export function flushBackgroundTasksForTest(): void {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveNow();
+}

@@ -1,0 +1,102 @@
+import { NextResponse } from "next/server";
+import { getAIService } from "@/lib/ai";
+import { badRequest, createErrorResponse, ErrorCode, reportApiError } from "@/lib/api-errors";
+import { createLogger } from "@/lib/logger";
+import { describeQuestion, trackBackgroundTask } from "@/lib/background-tasks";
+import { prisma } from "@/lib/prisma";
+import { getNotebookCandidateTags } from "@/lib/ai/tag-service";
+import { resolveNotebookScope } from "@/lib/notebook-scope";
+import type { CandidateTags } from "@/lib/ai";
+import { consumeAiQuota } from "@/lib/ai-quota";
+import { withRecoverableResponse } from "@/lib/recoverable-response";
+import { getFixedQuestionGrade, resolveQuestionGrade } from "@/lib/question/question-grade";
+import { getAppTimeZone } from "@/lib/config";
+import { withUser } from "@/lib/api-handler";
+import type { AuthenticatedContext } from "@/lib/api-handler";
+import { MAX_AI_REQUEST_BODY_BYTES, reanswerBodySchema } from "@/lib/schemas/ai";
+import { readJsonBody, RequestBodyTooLargeError } from "@/lib/request-body";
+import { trackReanswer } from "@/lib/telemetry/events";
+
+const logger = createLogger('api:reanswer');
+
+async function handlePost(req: Request, { user }: AuthenticatedContext) {
+    logger.info('Reanswer API called');
+
+    try {
+        let rawBody: unknown;
+        try {
+            rawBody = await readJsonBody(req, MAX_AI_REQUEST_BODY_BYTES);
+        } catch (error) {
+            if (error instanceof RequestBodyTooLargeError) return badRequest('QUESTION_SAVE_TOO_LARGE');
+            throw error;
+        }
+        const parsed = reanswerBodySchema.safeParse(rawBody);
+        if (!parsed.success) {
+            logger.warn('Missing or invalid request body');
+            return badRequest("Missing question text");
+        }
+        const { questionText, language = 'zh', subject, imageBase64, gradeSemester, subjectId, forImport } = parsed.data;
+
+        logger.debug({
+            questionLength: questionText?.length,
+            language,
+            subject,
+            hasImage: !!imageBase64,
+            gradeSemester
+        }, 'Reanswer request received');
+
+        // 指定了错题本时，知识点只能从该错题本学段 + 学科下的全部标签中选择
+        let candidateTags: CandidateTags | undefined;
+        if (subjectId) {
+            const notebook = await prisma.subject.findFirst({
+                where: { id: subjectId, userId: user.id },
+                select: { name: true, stage: true, subjectKey: true, tagSet: true },
+            });
+            if (notebook) {
+                candidateTags = await getNotebookCandidateTags(resolveNotebookScope(notebook), notebook.tagSet || 'default', user.id);
+            }
+        }
+
+        const limited = await consumeAiQuota(user, 'reanswer');
+        if (limited) return limited;
+
+        const aiService = await getAIService({ userId: user.id, kind: 'reanswer' });
+        // 新录入的文字题遵循账户规则，已有题目的重新解题沿用其手工年级。
+        const gradeProfile = forImport === true
+            ? user : null;
+        const targetGrade = gradeSemester ?? (gradeProfile ? getFixedQuestionGrade(gradeProfile, getAppTimeZone()) : undefined);
+
+        // 根据是否有图片选择不同的重新解题方式
+        const result = await trackBackgroundTask(
+            { userId: user.id, kind: 'reanswer', subject: describeQuestion({ questionText }) },
+            () => trackReanswer(() => aiService.reanswerQuestion(questionText, language, subject, imageBase64, targetGrade, candidateTags))
+        );
+
+        logger.info('Reanswer successful');
+
+        return NextResponse.json(gradeProfile ? {
+            ...result,
+            gradeSemester: resolveQuestionGrade(gradeProfile, { gradeSemester, recognizedGradeSemester: result.gradeSemester }, getAppTimeZone()),
+        } : result);
+    } catch (error: unknown) {
+        const errorMessageFromError = error instanceof Error ? error.message : String(error);
+        const stack = error instanceof Error ? error.stack : undefined;
+        logger.error({ error: errorMessageFromError, stack }, 'Reanswer error occurred');
+
+        let errorMessage = errorMessageFromError || "Failed to reanswer question";
+
+        if (errorMessageFromError.includes('AI_AUTH_ERROR')) {
+            errorMessage = 'AI_AUTH_ERROR';
+        } else if (errorMessageFromError === 'AI_CONNECTION_FAILED') {
+            errorMessage = 'AI_CONNECTION_FAILED';
+        } else if (errorMessageFromError === 'AI_RESPONSE_ERROR') {
+            errorMessage = 'AI_RESPONSE_ERROR';
+        }
+
+        reportApiError("api:reanswer", error);
+        return createErrorResponse(errorMessage, 500, ErrorCode.AI_ERROR);
+    }
+}
+
+/** 耗时 AI 请求：浏览器中断连接后，前端可通过 /api/requests/:id 取回响应 */
+export const POST = withRecoverableResponse(withUser(handlePost));
