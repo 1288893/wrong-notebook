@@ -23,9 +23,10 @@ const SUMMARY_LENGTH = 80;
 
 const PRACTICE_DIFFICULTIES = ['easy', 'medium', 'hard', 'harder'] as const;
 
-/** 练习进度配色：全对绿色、有对有错黄色、全错或未练习红色 */
+/** 练习进度配色：未练习中性色、全对绿色、有对有错黄色、全错红色 */
 function practiceTone(stat: { correct: number; total: number }): string {
-    if (stat.total > 0 && stat.correct === stat.total) return "text-green-600 dark:text-green-400";
+    if (stat.total === 0) return "text-muted-foreground";
+    if (stat.correct === stat.total) return "text-green-600 dark:text-green-400";
     if (stat.correct > 0) return "text-amber-600 dark:text-amber-400";
     return "text-red-600 dark:text-red-400";
 }

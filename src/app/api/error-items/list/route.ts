@@ -34,7 +34,9 @@ async function loadPracticeStats(ids: string[]): Promise<Map<string, ErrorItemPr
         by: ['errorItemId', 'difficulty', 'result'],
         where: {
             errorItemId: { in: ids },
-            result: { in: ['correct', 'wrong', 'not_attempted'] },
+            // 重复导入的记录不代表真实作答；「未作答」也不计入作答次数（与 weak-tags 接口口径一致）
+            source: { not: 'duplicate_import' },
+            result: { in: ['correct', 'wrong'] },
         },
         _count: { _all: true },
     });
