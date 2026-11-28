@@ -306,6 +306,30 @@ describe('数据导出后再导入（真实 SQLite）', () => {
         expect(await database.bankQuestion.count()).toBe(2);
     });
 
+    it('导入全部时，导出文件引用了本实例不存在的用户会被明确拒绝', async () => {
+        mocks.session = { user: { id: 'user-1', email: 'backup-test@example.com', role: 'admin' }, expires: '2099-01-01' };
+        await database.user.update({ where: { id: 'user-1' }, data: { role: 'admin' } });
+
+        const backup = await exportBackup('?all=true');
+        // 模拟「把线上整站备份导到另一台实例」：记录仍指向原实例的用户 ID
+        const foreign = {
+            ...backup,
+            subjects: backup.subjects.map((subject: { userId: string }) => ({ ...subject, userId: 'user-from-other-instance' })),
+        };
+
+        const response = await IMPORT(new Request('http://localhost/api/import?all=true', {
+            method: 'POST',
+            body: JSON.stringify(foreign),
+            headers: { 'Content-Type': 'application/json' },
+        }));
+
+        expect(response.status).toBe(400);
+        const body = await response.json();
+        expect(body.message).toContain('1 user(s)');
+        // 预检在事务之前完成，本地数据不受影响
+        expect(await database.subject.count({ where: { userId: 'user-1' } })).toBeGreaterThan(0);
+    });
+
     it('真题库导入默认不进错题，可选写入；按知识点从题库选题', async () => {
         mocks.session = { user: { id: 'user-1', email: 'backup-test@example.com', role: 'admin' }, expires: '2099-01-01' };
         await database.user.update({ where: { id: 'user-1' }, data: { role: 'admin' } });
