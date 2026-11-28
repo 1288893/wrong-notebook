@@ -40,7 +40,7 @@ describe('fromErrorItem', () => {
     });
 
     it('完整字段映射正确', () => {
-        const result = fromErrorItem(makeSource());
+        const result = fromErrorItem(makeSource(), false, true);
         expect(result).not.toBeNull();
         expect(result!.text).toBe('计算：1+1=？');
         expect(result!.answer).toBe('2');
@@ -53,6 +53,11 @@ describe('fromErrorItem', () => {
         expect(result!.figureSvg).toBe('<svg xmlns="http://www.w3.org/2000/svg"/>');
         expect(result!.subject).toBe('数学');
         expect(result!.knowledgePoints).toEqual(['整数加法', '计算']);
+    });
+
+    it('未请求题目配图时省略 figureSvg', () => {
+        const result = fromErrorItem(makeSource());
+        expect(result!.figureSvg).toBeUndefined();
     });
 
     it('可选字段为空时省略', () => {
@@ -88,6 +93,21 @@ describe('fromErrorItem', () => {
     it('includeImages=false 时不导出图片', () => {
         const result = fromErrorItem(makeSource({ originalImageUrl: TINY_PNG_DATA_URL }), false);
         expect(result!.images).toBeUndefined();
+    });
+
+    it('includeImages=false 且 includeFigures=true 时导出题目配图且不导出拍照原图', () => {
+        const result = fromErrorItem(
+            makeSource({
+                originalImageUrl: TINY_PNG_DATA_URL,
+                figureImage: TINY_PNG_DATA_URL,
+                figureSource: 'image',
+            }),
+            false,
+            true,
+        );
+        expect(result!.images).toBeUndefined();
+        expect(result!.figureImage).toBe(TINY_PNG_DATA_URL);
+        expect(result!.figureSource).toBe('image');
     });
 
     it('includeImages=true 且 originalImageUrl 是 data:image/png 时放入 images', () => {

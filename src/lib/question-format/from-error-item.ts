@@ -17,6 +17,8 @@ export interface ErrorItemExportSource {
     gradeSemester: string | null;
     source: string | null;
     figureSvg: string | null;
+    figureImage?: string | null;
+    figureSource?: string | null;
     originalImageUrl: string;
     subjectName: string | null;
     tags: { name: string }[];
@@ -29,8 +31,14 @@ const IMAGE_DATA_URL_PATTERN = /^data:image\/(png|jpeg|webp);base64,/;
  * 将单个 ErrorItem 映射为交换格式题目。
  * 题干为空（null、undefined 或去空白后无内容）时返回 null，由调用方计数到 warnings。
  * includeImages 为 true 且 originalImageUrl 是合法 data URL 且不超上限时写入 images。
+ * includeFigures 为 true 时写入题目配图（figureSvg / figureImage / figureSource）；
+ * 为 false 时三者一并省略，保证「包含题目配图」开关与导出内容一致。
  */
-export function fromErrorItem(item: ErrorItemExportSource, includeImages?: boolean): StructuredQuestion | null {
+export function fromErrorItem(
+    item: ErrorItemExportSource,
+    includeImages?: boolean,
+    includeFigures?: boolean,
+): StructuredQuestion | null {
     const text = item.questionText;
     if (text === null || text === undefined || text.trim().length === 0) return null;
 
@@ -44,8 +52,16 @@ export function fromErrorItem(item: ErrorItemExportSource, includeImages?: boole
     if (item.subjectName) question.subject = item.subjectName;
     if (item.gradeSemester) question.gradeSemester = item.gradeSemester;
     if (item.source) question.source = item.source;
-    if (item.figureSvg) question.figureSvg = item.figureSvg;
+    if (includeFigures && item.figureSvg) question.figureSvg = item.figureSvg;
     if (item.tags.length > 0) question.knowledgePoints = item.tags.map((t) => t.name);
+
+    if (includeFigures && item.figureImage && IMAGE_DATA_URL_PATTERN.test(item.figureImage)
+        && item.figureImage.length <= MAX_IMAGE_DATA_URL_LENGTH) {
+        question.figureImage = item.figureImage;
+    }
+    if (includeFigures && (item.figureSource === "svg" || item.figureSource === "image")) {
+        question.figureSource = item.figureSource;
+    }
 
     if (includeImages && IMAGE_DATA_URL_PATTERN.test(item.originalImageUrl)
         && item.originalImageUrl.length <= MAX_IMAGE_DATA_URL_LENGTH) {
